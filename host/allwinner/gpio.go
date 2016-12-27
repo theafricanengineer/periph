@@ -10,10 +10,15 @@ package allwinner
 import (
 	"errors"
 	"fmt"
+	"os"
+	"reflect"
 	"time"
 
+	"periph.io/x/periph"
 	"periph.io/x/periph/conn/gpio"
 	"periph.io/x/periph/conn/gpio/gpioreg"
+	"periph.io/x/periph/conn/gpio/stream"
+	"periph.io/x/periph/host/pmem"
 	"periph.io/x/periph/host/sysfs"
 )
 
@@ -223,9 +228,84 @@ func (p *Pin) Out(l gpio.Level) error {
 	return nil
 }
 
-// PWM is not supported.
-func (p *Pin) PWM(duty int) error {
-	return p.wrap(errors.New("pwm is not supported"))
+// PWM sets the PWM output on supported pins.
+//
+// To use as a general purpose clock, set duty to 32768.
+//
+// Using 0 as period will use the default value of 10kHz.
+//
+// The supported pin(s) vary across the CPU architecture. See the following
+// example to retrieve the pin for the first PWM:
+func (p *Pin) PWM(duty gpio.Duty, period time.Duration) error {
+	if !p.available {
+		return p.wrap(errors.New("not available on this CPU architecture"))
+	}
+	if duty == 0 {
+		return p.Out(gpio.Low)
+	} else if duty == gpio.DutyMax {
+		return p.Out(gpio.High)
+	}
+	if p.altFunc[0] != "PWM" {
+		return p.wrap(errors.New("pwm is not supported on this pin"))
+	}
+	// Intentionally check later, so a more informative error is returned on
+	// unsupported pins.
+	if pwmMemory == nil {
+		return p.wrap(errors.New("subsystem not initialized"))
+	}
+	// TODO(maruel): Use a hard coded 1kHz frequency for now.
+	pwmMemory.ctl &^= pwm0Mask
+	pwmMemory.ctl |= pwm0Prescale120
+	p.setFunction(alt1)
+	// TODO(maruel): Improve resolution; right now it's only 200 gradation.
+	pwmMemory.period = toPeriod(200, uint16((duty*200)/gpio.DutyMax))
+	pwmMemory.ctl |= pwm0Enable | pwm0SCLK
+	return nil
+}
+
+func (p *Pin) Stream(s gpio.Stream) error {
+	if p.Name() != "PE2" {
+		return p.wrap(errors.New("must use PE2"))
+	}
+	// TODO(maruel): Optimize.
+	if err := p.Out(gpio.Low); err != nil {
+		return err
+	}
+	//if err := Stream(p, s, nil); err != nil {
+	//	return p.wrap(err)
+	//}
+	// Set as SPI2_MOSI.
+	p.setFunction(alt3)
+	b := s.(*stream.Bits)
+	if err := spi2Write(b.Bits); err != nil {
+		return p.wrap(err)
+	}
+	return nil
+}
+
+func (p *Pin) ReadStream(pull gpio.Pull, resolution time.Duration, b gpio.Bits) error {
+	if p.Name() != "PE3" {
+		return p.wrap(errors.New("must use PE3"))
+	}
+	if pull != gpio.PullNoChange {
+		// TODO(maruel): Optimize.
+		if err := p.In(pull, gpio.NoEdge); err != nil {
+			return err
+		}
+	}
+	// Set as SPI2_MISO.
+	p.setFunction(alt3)
+	//if err := Stream(p, nil, resolution, b); err != nil {
+	if err := spi2Read(b); err != nil {
+		return p.wrap(err)
+	}
+	p.setFunction(in)
+	return nil
+}
+
+// DefaultPull returns the default pull for the pin.
+func (p *Pin) DefaultPull() gpio.Pull {
+	return p.defaultPull
 }
 
 //
@@ -259,19 +339,8 @@ func (p *Pin) wrap(err error) error {
 
 //
 
-// ===== PinIO implementation.
-// Page 73 for memory mapping overview.
-// Page 194 for PWM.
-// Page 230 for crypto engine.
-// Page 278 audio including ADC.
-// Page 376 GPIO PB to PH
-// Page 410 GPIO PL
-// Page 536 I²C (I2C)
-// Page 545 SPI
-// Page 560 UART
-// Page 621 I2S/PCM
-
-// Page 23~24
+// A64: Page 23~24
+// R8: Page 322-334.
 // Each pin can have one of 7 functions.
 const (
 	in       function = 0
@@ -284,7 +353,12 @@ const (
 	disabled function = 7
 )
 
-var gpioMemory *gpioMap
+var (
+	// gpioMemory is the memory map of the CPU GPIO registers.
+	gpioMemory *gpioMap
+	// gpioBaseAddr is the physical base address of the GPIO registers.
+	gpioBaseAddr uint32
+)
 
 // cpupins that may be implemented by a generic Allwinner CPU. Not all pins
 // will be present on all models and even if the CPU model supports them they
@@ -586,3 +660,65 @@ type gpioMap struct {
 	// PB to PH. The first group is unused.
 	groups [8]gpioGroup
 }
+
+// driverGPIO implements periph.Driver.
+type driverGPIO struct {
+}
+
+func (d *driverGPIO) String() string {
+	return "allwinner-gpio"
+}
+
+func (d *driverGPIO) Prerequisites() []string {
+	return nil
+}
+
+// Init does nothing if an allwinner processor is not detected. If one is
+// detected, it memory maps gpio CPU registers and then sets up the pin mapping
+// for the exact processor model detected.
+func (d *driverGPIO) Init() (bool, error) {
+	if !Present() {
+		return false, errors.New("Allwinner CPU not detected")
+	}
+	switch {
+	case IsA64():
+		// Page 373.
+		gpioBaseAddr = 0x01C20800
+	case IsR8():
+		// Page 323.
+		gpioBaseAddr = 0x01C20800
+	default:
+		return false, errors.New("unknown Allwinner CPU model")
+	}
+	if err := pmem.MapStruct(uint64(gpioBaseAddr), reflect.ValueOf(&gpioMemory)); err != nil {
+		if os.IsPermission(err) {
+			return true, fmt.Errorf("need more access, try as root: %v", err)
+		}
+		return true, err
+	}
+
+	switch {
+	case IsA64():
+		mapA64Pins()
+	case IsR8():
+		mapR8Pins()
+	default:
+		return false, errors.New("unknown Allwinner CPU model")
+	}
+
+	return true, initPins()
+}
+
+func init() {
+	if isArm {
+		periph.MustRegister(&driverGPIO{})
+	}
+}
+
+var _ gpio.DefaultPuller = &Pin{}
+var _ gpio.PinIO = &Pin{}
+var _ gpio.PinIn = &Pin{}
+var _ gpio.PinOut = &Pin{}
+var _ gpio.PWMer = &Pin{}
+var _ gpio.PinStreamReader = &Pin{}
+var _ gpio.PinStreamer = &Pin{}

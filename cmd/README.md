@@ -24,6 +24,9 @@ it](https://periph.io/project/contributing/).
 - [ssd1306](ssd1306): Writes text, an image or an animated GIF to an OLED
   display.
 - [tm1637](tm1637): Writes to a segment digits display.
+- [tm1637](tm1637): Writes to a segment digits display.
+- [ws2812b](ws2812b): Writes to a LED strip of WS2812b (sometimes called
+  NeoPixel). Can show an image animating on the Y axis.
 
 
 ## Buses

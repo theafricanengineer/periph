@@ -7,11 +7,8 @@ package bcm283x
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"path"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 
@@ -43,20 +40,20 @@ var (
 	GPIO15 *Pin // UART0_RXD, UART1_RXD
 	GPIO16 *Pin // UART0_CTS, SPI1_CS2, UART1_CTS
 	GPIO17 *Pin // UART0_RTS, SPI1_CS1, UART1_RTS
-	GPIO18 *Pin // PCM_CLK, SPI1_CS0, PWM0_OUT
-	GPIO19 *Pin // PCM_FS, SPI1_MISO, PWM1_OUT
-	GPIO20 *Pin // PCM_DIN, SPI1_MOSI, GPCLK0
-	GPIO21 *Pin // PCM_DOUT, SPI1_CLK, GPCLK1
+	GPIO18 *Pin // I2S_CLK, SPI1_CS0, PWM0_OUT
+	GPIO19 *Pin // I2S_FS, SPI1_MISO, PWM1_OUT
+	GPIO20 *Pin // I2S_DIN, SPI1_MOSI, GPCLK0
+	GPIO21 *Pin // I2S_DOUT, SPI1_CLK, GPCLK1
 	GPIO22 *Pin //
 	GPIO23 *Pin //
 	GPIO24 *Pin //
 	GPIO25 *Pin //
 	GPIO26 *Pin //
 	GPIO27 *Pin //
-	GPIO28 *Pin // I2C0_SDA, PCM_CLK
-	GPIO29 *Pin // I2C0_SCL, PCM_FS
-	GPIO30 *Pin // PCM_DIN, UART0_CTS, UART1_CTS
-	GPIO31 *Pin // PCM_DOUT, UART0_RTS, UART1_RTS
+	GPIO28 *Pin // I2C0_SDA, I2S_CLK
+	GPIO29 *Pin // I2C0_SCL, I2S_FS
+	GPIO30 *Pin // I2S_DIN, UART0_CTS, UART1_CTS
+	GPIO31 *Pin // I2S_DOUT, UART0_RTS, UART1_RTS
 	GPIO32 *Pin // GPCLK0, UART0_TXD, UART1_TXD
 	GPIO33 *Pin // UART0_RXD, UART1_RXD
 	GPIO34 *Pin // GPCLK0
@@ -280,14 +277,115 @@ func (p *Pin) Out(l gpio.Level) error {
 	return nil
 }
 
-// PWM implements gpio.PinOut.
-func (p *Pin) PWM(duty int) error {
-	return p.wrap(errors.New("pwm is not supported"))
+// PWM sets the PWM output on supported pins.
+//
+// The supported PWM pins are 12, 13, 18, 19, 40, 41 and 45.
+//
+// The supported clock pins are 4, 6, 20, 32, 34 and 43. These can only be used
+// with duty set to gpio.DutyHalf. They also have relatively limited frequency
+// range from 4.8kHz to 1MHz with specific values supported.
+func (p *Pin) PWM(duty gpio.Duty, period time.Duration) error {
+	if duty == 0 {
+		return p.Out(gpio.Low)
+	} else if duty == gpio.DutyMax {
+		return p.Out(gpio.High)
+	}
+	if period < 500*time.Nanosecond {
+		// High clock rate tends to hang the RPi. Need to investigate more.
+		return p.wrap(errors.New("period must be at least 500ns"))
+	}
+	f := alt0
+	var clk *clock
+	switch p.number {
+	case 4, 32, 34:
+		if duty != gpio.DutyHalf {
+			return p.wrap(errors.New("pin can only be used with 50% duty cycle"))
+		}
+		clk = &clockMemory.gp0
+	case 5, 21, 42, 44:
+		return p.wrap(errors.New("GPCLK1 cannot be safely used"))
+	case 6, 43:
+		if duty != gpio.DutyHalf {
+			return p.wrap(errors.New("pin can only be used with 50% duty cycle"))
+		}
+		clk = &clockMemory.gp2
+	case 20:
+		if duty != gpio.DutyHalf {
+			return p.wrap(errors.New("pin can only be used with 50% duty cycle"))
+		}
+		clk = &clockMemory.gp0
+		f = alt5
+	case 12, 13, 40, 41, 45: // PWM
+	case 18, 19: // PWM
+		f = alt5
+	default:
+		// Technically 52 and 53 could also support PWM as alt1 but they are assumed
+		// to be used for the SD Card.
+		return p.wrap(errors.New("pwm is not supported on this pin"))
+	}
+	// Intentionally check later, so a more informative error is returned on
+	// unsupported pins.
+	if pwmMemory == nil || clockMemory == nil {
+		return p.wrap(errors.New("pwm support is not initialized"))
+	}
+
+	// Convert period to frequency. This is lossy.
+	hz := uint64(time.Second / period)
+
+	if clk != nil {
+		// Using a clock pin.
+		actual, waits, err := clk.set(hz, 1)
+		if err != nil {
+			return p.wrap(err)
+		}
+		if actual != hz {
+			return p.wrap(fmt.Errorf("asked for %dHz, got %dHz", hz, actual))
+		}
+		if waits != 1 {
+			return p.wrap(fmt.Errorf("got oversampled clock by %dx", waits))
+		}
+		p.setFunction(f)
+		return nil
+	}
+
+	// TODO(maruel): Leverage oversampling.
+	if _, _, err := clockMemory.pwm.set(uint64(time.Second/period), 1); err != nil {
+		return p.wrap(err)
+	}
+	shift := uint((p.number & 1) * 8)
+	// rng1/rng2 are already 32.
+	if shift == 0 {
+		pwmMemory.dat1 = uint32(duty)<<16 | uint32(duty)
+	} else {
+		pwmMemory.dat2 = uint32(duty)<<16 | uint32(duty)
+	}
+	pwmMemory.ctl |= pwm1Enable << shift
+	p.setFunction(f)
+	return nil
 }
 
-// Special functionality.
+func (p *Pin) Stream(s gpio.Stream) error {
+	if err := p.Out(gpio.Low); err != nil {
+		return err
+	}
+	if err := writeStream(p, s); err != nil {
+		return p.wrap(err)
+	}
+	return nil
+}
 
-// DefaultPull returns the default pull for the function.
+// ReadStream reads a stream.
+func (p *Pin) ReadStream(pull gpio.Pull, resolution time.Duration, b gpio.Bits) error {
+	if err := p.In(pull, gpio.NoEdge); err != nil {
+		return err
+	}
+	if err := readStream(p, resolution, b); err != nil {
+		return p.wrap(err)
+	}
+	return nil
+}
+
+// DefaultPull returns the default pull for the pin.
 //
 // The CPU doesn't return the current pull.
 func (p *Pin) DefaultPull() gpio.Pull {
@@ -329,7 +427,19 @@ const (
 	alt5 function = 2
 )
 
-var gpioMemory *gpioMap
+var (
+	// baseAddr is the base for all the CPU registers.
+	//
+	// It is initialized by driverGPIO.Init().
+	baseAddr uint32
+	// dramBus is high bits to address uncached memory. See virtToUncachedPhys()
+	// in dma.go.
+	dramBus uint32
+	// gpioMemory is the memory map of the CPU GPIO registers.
+	gpioMemory *gpioMap
+	// gpioBaseAddr is needed for DMA transfers.
+	gpioBaseAddr uint32
+)
 
 // cpuPins is all the pins as supported by the CPU. There is no guarantee that
 // they are actually connected to anything on the board.
@@ -403,6 +513,7 @@ var mapping = [][6]string{
 	{"UART0_RXD", "", "", "", "", "UART1_RXD"}, // 15
 	{"", "", "", "UART0_CTS", "SPI1_CS2", "UART1_CTS"},
 	{"", "", "", "UART0_RTS", "SPI1_CS1", "UART1_RTS"},
+	// TODO(maruel): Alias the PCM_xxx to I2S0_xxx.
 	{"PCM_CLK", "", "", "", "SPI1_CS0", "PWM0_OUT"},
 	{"PCM_FS", "", "", "", "SPI1_MISO", "PWM1_OUT"},
 	{"PCM_DIN", "", "", "", "SPI1_MOSI", "GPCLK0"}, // 20
@@ -578,28 +689,6 @@ func sleep150cycles() uint32 {
 	return out
 }
 
-// getBaseAddress queries the virtual file system to retrieve the base address
-// of the GPIO registers.
-//
-// Defaults to 0x3F200000 as per datasheet if could query the file system.
-func getBaseAddress() uint64 {
-	items, _ := ioutil.ReadDir("/sys/bus/platform/drivers/pinctrl-bcm2835/")
-	for _, item := range items {
-		if item.Mode()&os.ModeSymlink != 0 {
-			parts := strings.SplitN(path.Base(item.Name()), ".", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			base, err := strconv.ParseUint(parts[0], 16, 64)
-			if err != nil {
-				continue
-			}
-			return base
-		}
-	}
-	return 0x3F200000
-}
-
 // driverGPIO implements periph.Driver.
 type driverGPIO struct {
 }
@@ -616,13 +705,35 @@ func (d *driverGPIO) Init() (bool, error) {
 	if !Present() {
 		return false, errors.New("bcm283x CPU not detected")
 	}
+	model := distro.CPUInfo()["model name"]
+	if strings.Index(model, "ARMv6") != -1 {
+		baseAddr = 0x20000000
+		dramBus = 0x40000000
+	} else {
+		// RPi2+
+		baseAddr = 0x3F000000
+		dramBus = 0xC0000000
+	}
+	// Page 6.
+	// Virtual addresses in kernel mode will range between 0xC0000000 and
+	// 0xEFFFFFFF.
+	// Virtual addresses in user mode (i.e. seen by processes running in ARM
+	// Linux) will range between 0x00000000 and 0xBFFFFFFF.
+	// Peripherals (at physical address 0x20000000 on) are mapped into the kernel
+	// virtual address space starting at address 0xF2000000. Thus a peripheral
+	// advertised here at bus address 0x7Ennnnnn is available in the ARM kenel at
+	// virtual address 0xF2nnnnnn.
+
+	gpioBaseAddr = baseAddr + 0x200000
 	m, err := pmem.MapGPIO()
 	if err != nil {
 		// Try without /dev/gpiomem. This is the case of not running on Raspbian or
 		// raspbian before Jessie. This requires running as root.
 		var err2 error
-		m, err2 = pmem.Map(getBaseAddress(), 4096)
+		m, err2 = pmem.Map(uint64(gpioBaseAddr), 4096)
+		var err error
 		if err2 != nil {
+			panic(err2)
 			if distro.IsRaspbian() {
 				// Raspbian specific error code to help guide the user to troubleshoot
 				// the problems.
@@ -670,6 +781,10 @@ func init() {
 	}
 }
 
+var _ gpio.DefaultPuller = &Pin{}
+var _ gpio.PinIO = &Pin{}
 var _ gpio.PinIn = &Pin{}
 var _ gpio.PinOut = &Pin{}
-var _ gpio.PinIO = &Pin{}
+var _ gpio.PWMer = &Pin{}
+var _ gpio.PinStreamReader = &Pin{}
+var _ gpio.PinStreamer = &Pin{}
