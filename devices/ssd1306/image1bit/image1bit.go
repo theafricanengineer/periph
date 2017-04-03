@@ -9,7 +9,6 @@
 package image1bit
 
 import (
-	"errors"
 	"image"
 	"image/color"
 	"image/draw"
@@ -39,6 +38,9 @@ const (
 	Off = Bit(false)
 )
 
+// BitModel is the color Model for 1 bit color.
+var BitModel = color.ModelFunc(convert)
+
 // Image is a 1 bit (black and white) image.
 //
 // The packing used is unusual, each byte is 8 vertical pixels, with each byte
@@ -52,13 +54,11 @@ type Image struct {
 }
 
 // New returns an initialized Image instance.
-func New(r image.Rectangle) (*Image, error) {
+func New(r image.Rectangle) *Image {
 	h := r.Dy()
 	w := r.Dx()
-	if h&7 != 0 {
-		return nil, errors.New("image1bit: height must be multiple of 8")
-	}
-	return &Image{w, h, make([]byte, w*h/8)}, nil
+	stride := (h + 7) &^ 7
+	return &Image{w, h, make([]byte, w*stride/8)}
 }
 
 // SetAll sets all pixels to On.
@@ -84,7 +84,7 @@ func (i *Image) Inverse() {
 
 // ColorModel implements image.Image.
 func (i *Image) ColorModel() color.Model {
-	return color.ModelFunc(convert)
+	return BitModel
 }
 
 // Bounds implements image.Image.
